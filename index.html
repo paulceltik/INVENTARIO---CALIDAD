@@ -37,6 +37,7 @@ html,body{height:100%;width:100%;background:var(--gris-bg);font-family:-apple-sy
 .sync-dot.online{background:#4ADE80;box-shadow:0 0 5px #4ADE80}
 .sync-dot.offline{background:#F87171}
 .sync-dot.syncing{background:#FBBF24;animation:pulse-dot 0.8s ease-in-out infinite}
+.sync-dot.unknown{background:#9DA8B5}
 @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.3}}
 .bottom-nav{display:flex;background:var(--blanco);border-top:1px solid var(--gris-clar);flex-shrink:0;box-shadow:0 -2px 12px rgba(31,56,100,0.08)}
 .nav-item{flex:1;padding:10px 6px 8px;border:none;background:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;font-size:10px;font-weight:600;color:var(--gris-med);border-top:2.5px solid transparent;transition:var(--trans);-webkit-tap-highlight-color:transparent}
@@ -391,6 +392,7 @@ html,body{height:100%;width:100%;background:var(--gris-bg);font-family:-apple-sy
     <div class="modal-body" id="td-body"></div>
     <div class="modal-footer">
       <button class="btn btn-outline" style="flex:1" onclick="cerrarModal('ov-tool-detail')">Cerrar</button>
+      <button class="btn btn-outline btn-sm" id="td-edit-btn">✏️ Editar</button>
       <button class="btn btn-naranja btn-sm" id="td-action-btn">Acción</button>
     </div>
   </div>
@@ -420,6 +422,7 @@ html,body{height:100%;width:100%;background:var(--gris-bg);font-family:-apple-sy
     </div>
     <div class="modal-footer">
       <button class="btn btn-outline" style="flex:1" onclick="cerrarModal('ov-worker')">Cancelar</button>
+      <button class="btn btn-rojo btn-sm" id="mw-del-btn" onclick="eliminarWorker()" style="display:none">🗑️ Eliminar</button>
       <button class="btn btn-verde" style="flex:1" onclick="guardarWorker()">✅ Guardar</button>
     </div>
   </div>
@@ -998,18 +1001,21 @@ async function autoSync(){
     const data=await res.json();
     if(data.ok){
       pendingSync=[];save(K.pending,pendingSync);
+      conexionConfirmada = true;
       setSyncStatus('online',`Sync OK`);
       renderSyncBanners();
       reintentosSync = 0; // éxito — resetear contador de reintentos
       if(reintentoTimeoutId){ clearTimeout(reintentoTimeoutId); reintentoTimeoutId=null; }
     }else{
       // El script respondió pero indicó un error de su lado (ej. ID de hoja inválido)
+      conexionConfirmada = false;
       setSyncStatus('offline',`${pendingSync.length} pendientes`);
       renderSyncBanners();
       toast('⚠️ Sheets rechazó el envío: '+(data.error||'error desconocido'),'err');
       programarReintentoSync();
     }
   }catch(e){
+    conexionConfirmada = false;
     setSyncStatus('offline',`${pendingSync.length} pendientes`);
     renderSyncBanners();
     // Mostrar la razón real del fallo, no solo "sin conexión" — ayuda a diagnosticar
@@ -1037,12 +1043,25 @@ function programarReintentoSync(){
    Esto es lo que permite que celular, laptop y PC vean el MISMO
    estado de herramientas, no cada uno el suyo por separado. */
 let ultimaDescargaTs = 0;
+let conexionConfirmada = false; // solo true después de un round-trip REAL exitoso con el Apps Script
 const INTERVALO_MIN_DESCARGA_MS = 20000; // no descargar más de una vez cada 20s
 
 function parseFechaHoraPeru(fecha, hora){
   try{
-    const [d,m,y] = String(fecha).split('/').map(Number);
+    // Si Sheets devolvió un objeto de fecha real, JSON lo convierte a ISO
+    // (ej: "2026-06-18T05:00:00.000Z") en vez de "18/06/2026" — detectarlo
+    const fechaTxt = String(fecha);
+    if(fechaTxt.includes('T') && fechaTxt.includes('-')){
+      const ts = new Date(fechaTxt).getTime();
+      if(!isNaN(ts)) return ts;
+    }
+    const [d,m,y] = fechaTxt.split('/').map(Number);
     let txt = String(hora).trim();
+    // La hora también puede venir como ISO si Sheets la guardó como fecha
+    if(txt.includes('T') && txt.includes('-')){
+      const tsHora = new Date(txt).getTime();
+      if(!isNaN(tsHora)) return tsHora;
+    }
     const esPM = /p\.?\s*m\.?/i.test(txt);
     const esAM = /a\.?\s*m\.?/i.test(txt);
     txt = txt.replace(/[^\d:]/g,'');
@@ -1050,7 +1069,8 @@ function parseFechaHoraPeru(fecha, hora){
     hh = hh||0; mm = mm||0;
     if(esPM && hh < 12) hh += 12;
     if(esAM && hh === 12) hh = 0;
-    return new Date(y, (m||1)-1, d||1, hh, mm).getTime();
+    const resultado = new Date(y, (m||1)-1, d||1, hh, mm).getTime();
+    return isNaN(resultado) ? Date.now() : resultado;
   }catch(e){ return Date.now(); }
 }
 
@@ -1072,11 +1092,15 @@ async function descargarEstado(forzar){
     const data = await res.json();
     if(!data.ok || !data.estadoHerramientas){
       console.warn('descargarEstado: respuesta sin estadoHerramientas', data);
-      if(forzar) toast('⚠️ El script respondió pero sin datos válidos. Revisa que tenga la función obtenerEstado.','warn');
+      conexionConfirmada = false;
+      if(pendingSync.length===0) setSyncStatus('offline','Script sin actualizar');
+      renderSyncBanners();
+      if(forzar) toast('⚠️ El script respondió pero sin datos válidos. Revisa que tenga la función obtenerEstado y que hayas creado una NUEVA versión de implementación.','warn');
       return;
     }
-    // Conexión confirmada — si no hay pendientes por subir, el punto puede ponerse verde
-    if(pendingSync.length===0) setSyncStatus('online','Conectado');
+    // Conexión confirmada de verdad — recién aquí el punto puede ponerse verde
+    conexionConfirmada = true;
+    if(pendingSync.length===0){ setSyncStatus('online','Conectado'); renderSyncBanners(); }
 
     // 1) Traer movimientos que otros dispositivos registraron y este no tiene
     const idsLocales = new Set(movements.map(m=>m.id));
@@ -1112,33 +1136,41 @@ async function descargarEstado(forzar){
     });
     if(cambios>0) save(K.tools, tools);
 
-    // 3) Traer herramientas que otro dispositivo agregó y este no tiene todavía
-    //    (solo se AGREGAN las que faltan — nunca se pisa una edición local)
-    let herramientasNuevas = 0;
+    // 3) Traer herramientas que otro dispositivo agregó, y ACTUALIZAR datos
+    //    de las que ya existen (nombre/categoría/desc) — Sheets manda.
+    //    Antes solo se agregaban las que faltaban; los EDITS nunca llegaban.
+    let herramientasNuevas = 0, herramientasActualizadas = 0;
     (data.herramientas||[]).forEach(rh=>{
       if(!rh.code) return;
       const existe = tools.find(t=>t.code===rh.code);
       if(!existe){
         tools.push({ id:rh.id||('t'+Date.now()+Math.random().toString(36).slice(2,6)), code:rh.code, name:rh.name, cat:rh.cat||'otro', desc:rh.desc||'', status:'in' });
         herramientasNuevas++;
+      }else if(existe.name!==rh.name || existe.cat!==rh.cat || existe.desc!==(rh.desc||'')){
+        existe.name = rh.name; existe.cat = rh.cat||existe.cat; existe.desc = rh.desc||'';
+        herramientasActualizadas++;
       }
     });
-    if(herramientasNuevas>0) save(K.tools, tools);
+    if(herramientasNuevas>0 || herramientasActualizadas>0) save(K.tools, tools);
 
-    // 4) Traer trabajadores que otro dispositivo agregó y este no tiene todavía
-    let trabajadoresNuevos = 0;
+    // 4) Lo mismo para trabajadores: agregar los que falten Y actualizar
+    //    nombre/área/estado de los que ya existen
+    let trabajadoresNuevos = 0, trabajadoresActualizados = 0;
     (data.trabajadores||[]).forEach(rw=>{
       if(!rw.code) return;
       const existe = workers.find(w=>w.code===rw.code);
       if(!existe){
         workers.push({ id:rw.id||('w'+Date.now()+Math.random().toString(36).slice(2,6)), code:rw.code, name:rw.name, area:rw.area||'', estado:rw.estado||'activo' });
         trabajadoresNuevos++;
+      }else if(existe.name!==rw.name || existe.area!==(rw.area||'') || existe.estado!==rw.estado){
+        existe.name = rw.name; existe.area = rw.area||''; existe.estado = rw.estado||existe.estado;
+        trabajadoresActualizados++;
       }
     });
-    if(trabajadoresNuevos>0) save(K.workers, workers);
+    if(trabajadoresNuevos>0 || trabajadoresActualizados>0) save(K.workers, workers);
 
     // Refrescar lo que esté visible en pantalla
-    if(nuevosMovs>0 || cambios>0 || herramientasNuevas>0 || trabajadoresNuevos>0){
+    if(nuevosMovs>0 || cambios>0 || herramientasNuevas>0 || herramientasActualizadas>0 || trabajadoresNuevos>0 || trabajadoresActualizados>0){
       actualizarKPIs();
       if(document.getElementById('pag-historial').classList.contains('activa')) renderHistorial();
       if(document.getElementById('pag-herramientas').classList.contains('activa')) renderTools();
@@ -1146,9 +1178,12 @@ async function descargarEstado(forzar){
       if(nuevosMovs>0) toast(`🔄 ${nuevosMovs} movimiento(s) de otros dispositivos`, 'ok');
       if(herramientasNuevas>0) toast(`🔧 ${herramientasNuevas} herramienta(s) nueva(s) de otros dispositivos`, 'ok');
       if(trabajadoresNuevos>0) toast(`👷 ${trabajadoresNuevos} trabajador(es) nuevo(s) de otros dispositivos`, 'ok');
+      if(herramientasActualizadas>0 || trabajadoresActualizados>0) toast(`🔄 Datos actualizados desde otro dispositivo`, 'ok');
     }
   }catch(e){
     console.warn('descargarEstado falló:', e);
+    conexionConfirmada = false;
+    if(pendingSync.length===0){ setSyncStatus('offline','Sin conexión'); renderSyncBanners(); }
     if(forzar) toast('⚠️ No se pudo descargar el estado: '+(e.message||'error de red'),'warn');
   }
 }
@@ -1212,9 +1247,17 @@ async function testConnection(){
 }
 function renderSyncBanners(){
   const p=pendingSync.length;
-  const html=p>0?`<div class="sync-banner err" style="margin-bottom:12px">⚠️ ${p} registro${p>1?'s':''} pendiente${p>1?'s':''} de enviar a Google Sheets <button class="btn btn-azul btn-sm" onclick="syncNow()" style="margin-left:8px">☁ Enviar</button></div>`:
-  cfg.scriptUrl?`<div class="sync-banner ok" style="margin-bottom:12px">✅ Todo sincronizado con Google Sheets</div>`:
-  `<div class="sync-banner" style="margin-bottom:12px">ℹ️ Sin Google Sheets configurado. Configura en ⚙ para sincronizar. <a href="#" onclick="abrirAdmin()" style="color:var(--azul);font-weight:700">Configurar</a></div>`;
+  let html;
+  if(p>0){
+    html=`<div class="sync-banner err" style="margin-bottom:12px">⚠️ ${p} registro${p>1?'s':''} pendiente${p>1?'s':''} de enviar a Google Sheets <button class="btn btn-azul btn-sm" onclick="syncNow()" style="margin-left:8px">☁ Enviar</button></div>`;
+  }else if(!cfg.scriptUrl){
+    html=`<div class="sync-banner" style="margin-bottom:12px">ℹ️ Sin Google Sheets configurado. Configura en ⚙ para sincronizar. <a href="#" onclick="abrirAdmin()" style="color:var(--azul);font-weight:700">Configurar</a></div>`;
+  }else if(conexionConfirmada){
+    html=`<div class="sync-banner ok" style="margin-bottom:12px">✅ Todo sincronizado con Google Sheets</div>`;
+  }else{
+    // Hay URL configurada, pero AÚN no se ha confirmado un round-trip real exitoso
+    html=`<div class="sync-banner" style="margin-bottom:12px">⏳ Conectando con Google Sheets... si esto no cambia, revisa la URL del script o la versión de implementación.</div>`;
+  }
   document.getElementById('sync-banner-escaneo').innerHTML=html;
 }
 function renderSyncBannerHist(){
@@ -1309,6 +1352,10 @@ function verDetalleTool(id){
     save(K.tools,tools);save(K.movements,movements);save(K.pending,pendingSync);
     renderTools();actualizarKPIs();autoSync();verificarTamanoHistorial();toast('✅ Movimiento registrado','ok');
   };
+  document.getElementById('td-edit-btn').onclick=()=>{
+    cerrarModal('ov-tool-detail');
+    abrirModalHerramienta(h.id); // reutiliza el modal que ya tiene editar + eliminar
+  };
   abrirModal('ov-tool-detail');
   setTimeout(()=>{try{new QRCode(document.getElementById('td-qr-wrap'),{text:h.code,width:90,height:90,colorDark:'#1F3864'});}catch(e){}},100);
 }
@@ -1340,7 +1387,22 @@ function abrirModalWorker(id){
   document.getElementById('mw-estado').value=w?w.estado:'activo';
   document.getElementById('wk-code-preview-box').classList.remove('show');
   document.getElementById('wk-qr-preview').innerHTML='';
+  document.getElementById('mw-del-btn').style.display=w?'flex':'none';
   abrirModal('ov-worker');
+}
+function eliminarWorker(){
+  const id=document.getElementById('mw-id').value;if(!id)return;
+  const w=workers.find(x=>x.id===id);if(!w)return;
+  const tieneMovs=movements.some(m=>m.codigoT===w.code);
+  const advertencia=tieneMovs
+    ? `${w.name} tiene movimientos registrados en el historial. Si solo quieres que no pueda usar el sistema, es más seguro marcarlo como "Inactivo" en vez de eliminarlo.\n\n¿Eliminar de todas formas (solo de este dispositivo)?`
+    : `¿Eliminar a ${w.name} de este dispositivo?`;
+  if(!confirm(advertencia))return;
+  workers=workers.filter(x=>x.id!==id);
+  save(K.workers,workers);
+  cerrarModal('ov-worker');
+  renderWorkers();
+  toast('Trabajador eliminado de este dispositivo','ok');
 }
 function guardarWorker(){
   const id=document.getElementById('mw-id').value;
@@ -1668,6 +1730,7 @@ function toast(msg,tipo){
 }
 function fmtTs(ts){
   const d=new Date(ts);
+  if(isNaN(d.getTime())) return '—';
   return d.toLocaleDateString('es-PE',{day:'2-digit',month:'2-digit'})+' '+d.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
 }
 
@@ -1688,7 +1751,10 @@ if(!cfg.scriptUrl){
 }else if(pendingSync.length>0){
   setSyncStatus('offline',pendingSync.length+' pendientes'); // rojo real: hay cosas sin enviar
 }else{
-  setSyncStatus('online','Conectado'); // verde: no hay pendientes, todo lo local ya se envió
+  // Gris: aún no se ha confirmado una conexión real en esta sesión.
+  // La descargarEstado(true) que corre 800ms después de esto lo pondrá
+  // en verde SOLO si realmente logra hablar con el Apps Script.
+  setSyncStatus('unknown','Verificando...');
 }
 </script>
 </body>
