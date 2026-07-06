@@ -991,6 +991,10 @@ async function autoSync(){
       headers:{'Content-Type':'text/plain'},
       body:JSON.stringify({accion:'registrar',rows})
     });
+    if(!res.ok){
+      // El servidor respondió pero con error HTTP (403, 404, 500, etc.)
+      throw new Error(`HTTP ${res.status} — revisa que la implementación del Apps Script esté en su última versión`);
+    }
     const data=await res.json();
     if(data.ok){
       pendingSync=[];save(K.pending,pendingSync);
@@ -999,11 +1003,20 @@ async function autoSync(){
       reintentosSync = 0; // éxito — resetear contador de reintentos
       if(reintentoTimeoutId){ clearTimeout(reintentoTimeoutId); reintentoTimeoutId=null; }
     }else{
+      // El script respondió pero indicó un error de su lado (ej. ID de hoja inválido)
       setSyncStatus('offline',`${pendingSync.length} pendientes`);
+      renderSyncBanners();
+      toast('⚠️ Sheets rechazó el envío: '+(data.error||'error desconocido'),'err');
       programarReintentoSync();
     }
   }catch(e){
     setSyncStatus('offline',`${pendingSync.length} pendientes`);
+    renderSyncBanners();
+    // Mostrar la razón real del fallo, no solo "sin conexión" — ayuda a diagnosticar
+    const razon = e.message && e.message.includes('Failed to fetch')
+      ? 'sin conexión a internet'
+      : e.message || 'error de red';
+    toast('⚠️ No se pudo sincronizar: '+razon,'warn');
     programarReintentoSync();
   }
 }
@@ -1053,8 +1066,17 @@ async function descargarEstado(forzar){
       headers:{'Content-Type':'text/plain'},
       body:JSON.stringify({accion:'obtenerEstado'})
     });
+    if(!res.ok){
+      throw new Error(`HTTP ${res.status} — revisa que la implementación del Apps Script esté en su última versión`);
+    }
     const data = await res.json();
-    if(!data.ok || !data.estadoHerramientas) return;
+    if(!data.ok || !data.estadoHerramientas){
+      console.warn('descargarEstado: respuesta sin estadoHerramientas', data);
+      if(forzar) toast('⚠️ El script respondió pero sin datos válidos. Revisa que tenga la función obtenerEstado.','warn');
+      return;
+    }
+    // Conexión confirmada — si no hay pendientes por subir, el punto puede ponerse verde
+    if(pendingSync.length===0) setSyncStatus('online','Conectado');
 
     // 1) Traer movimientos que otros dispositivos registraron y este no tiene
     const idsLocales = new Set(movements.map(m=>m.id));
@@ -1090,15 +1112,77 @@ async function descargarEstado(forzar){
     });
     if(cambios>0) save(K.tools, tools);
 
+    // 3) Traer herramientas que otro dispositivo agregó y este no tiene todavía
+    //    (solo se AGREGAN las que faltan — nunca se pisa una edición local)
+    let herramientasNuevas = 0;
+    (data.herramientas||[]).forEach(rh=>{
+      if(!rh.code) return;
+      const existe = tools.find(t=>t.code===rh.code);
+      if(!existe){
+        tools.push({ id:rh.id||('t'+Date.now()+Math.random().toString(36).slice(2,6)), code:rh.code, name:rh.name, cat:rh.cat||'otro', desc:rh.desc||'', status:'in' });
+        herramientasNuevas++;
+      }
+    });
+    if(herramientasNuevas>0) save(K.tools, tools);
+
+    // 4) Traer trabajadores que otro dispositivo agregó y este no tiene todavía
+    let trabajadoresNuevos = 0;
+    (data.trabajadores||[]).forEach(rw=>{
+      if(!rw.code) return;
+      const existe = workers.find(w=>w.code===rw.code);
+      if(!existe){
+        workers.push({ id:rw.id||('w'+Date.now()+Math.random().toString(36).slice(2,6)), code:rw.code, name:rw.name, area:rw.area||'', estado:rw.estado||'activo' });
+        trabajadoresNuevos++;
+      }
+    });
+    if(trabajadoresNuevos>0) save(K.workers, workers);
+
     // Refrescar lo que esté visible en pantalla
-    if(nuevosMovs>0 || cambios>0){
+    if(nuevosMovs>0 || cambios>0 || herramientasNuevas>0 || trabajadoresNuevos>0){
       actualizarKPIs();
       if(document.getElementById('pag-historial').classList.contains('activa')) renderHistorial();
       if(document.getElementById('pag-herramientas').classList.contains('activa')) renderTools();
+      if(document.getElementById('pag-trabajadores').classList.contains('activa')) renderWorkers();
       if(nuevosMovs>0) toast(`🔄 ${nuevosMovs} movimiento(s) de otros dispositivos`, 'ok');
+      if(herramientasNuevas>0) toast(`🔧 ${herramientasNuevas} herramienta(s) nueva(s) de otros dispositivos`, 'ok');
+      if(trabajadoresNuevos>0) toast(`👷 ${trabajadoresNuevos} trabajador(es) nuevo(s) de otros dispositivos`, 'ok');
     }
   }catch(e){
     console.warn('descargarEstado falló:', e);
+    if(forzar) toast('⚠️ No se pudo descargar el estado: '+(e.message||'error de red'),'warn');
+  }
+}
+
+/* ── SUBIR UNA HERRAMIENTA/TRABAJADOR NUEVO A SHEETS ──
+   Esto es lo que faltaba: sin esto, agregar una herramienta o
+   trabajador en un dispositivo se quedaba solo en ese dispositivo. */
+async function subirHerramientaRemoto(tool){
+  if(!cfg.scriptUrl || !tool) return;
+  try{
+    const res = await fetch(cfg.scriptUrl,{
+      method:'POST',
+      headers:{'Content-Type':'text/plain'},
+      body:JSON.stringify({accion:'subirHerramienta', herramienta:tool})
+    });
+    const data = await res.json();
+    if(!data.ok) console.warn('subirHerramientaRemoto: el script devolvió error', data);
+  }catch(e){
+    console.warn('subirHerramientaRemoto falló (quedará solo en este dispositivo por ahora):', e);
+  }
+}
+
+async function subirTrabajadorRemoto(worker){
+  if(!cfg.scriptUrl || !worker) return;
+  try{
+    const res = await fetch(cfg.scriptUrl,{
+      method:'POST',
+      headers:{'Content-Type':'text/plain'},
+      body:JSON.stringify({accion:'subirTrabajador', trabajador:worker})
+    });
+    const data = await res.json();
+    if(!data.ok) console.warn('subirTrabajadorRemoto: el script devolvió error', data);
+  }catch(e){
+    console.warn('subirTrabajadorRemoto falló (quedará solo en este dispositivo por ahora):', e);
   }
 }
 
@@ -1177,9 +1261,11 @@ function guardarHerramienta(){
   const desc=document.getElementById('mh-desc').value.trim();
   if(!code||!name){toast('Completa código y nombre','err');return;}
   if(!id&&tools.find(t=>t.code===code)){toast('Ya existe ese código','err');return;}
-  if(id){const t=tools.find(x=>x.id===id);Object.assign(t,{code,name,cat,desc});}
-  else{tools.push({id:'t'+Date.now(),code,name,cat,desc,status:'in'});}
+  let toolGuardada;
+  if(id){toolGuardada=tools.find(x=>x.id===id);Object.assign(toolGuardada,{code,name,cat,desc});}
+  else{toolGuardada={id:'t'+Date.now(),code,name,cat,desc,status:'in'};tools.push(toolGuardada);}
   save(K.tools,tools);cerrarModal('ov-herramienta');renderTools();actualizarKPIs();toast('✅ Herramienta guardada','ok');
+  subirHerramientaRemoto(toolGuardada);
 }
 function eliminarHerramienta(){
   const id=document.getElementById('mh-id').value;if(!id)return;
@@ -1264,9 +1350,11 @@ function guardarWorker(){
   const estado=document.getElementById('mw-estado').value;
   if(!code||!name){toast('Completa código y nombre','err');return;}
   if(!id&&workers.find(w=>w.code===code)){toast('Ya existe ese código de carnet','err');return;}
-  if(id){const w=workers.find(x=>x.id===id);Object.assign(w,{code,name,area,estado});}
-  else{workers.push({id:'w'+Date.now(),code,name,area,estado});}
+  let workerGuardado;
+  if(id){workerGuardado=workers.find(x=>x.id===id);Object.assign(workerGuardado,{code,name,area,estado});}
+  else{workerGuardado={id:'w'+Date.now(),code,name,area,estado};workers.push(workerGuardado);}
   save(K.workers,workers);cerrarModal('ov-worker');renderWorkers();toast('✅ Trabajador guardado','ok');
+  subirTrabajadorRemoto(workerGuardado);
 }
 function abrirRegistroRapido(){
   ocultarAvisoNuevo();
@@ -1280,10 +1368,12 @@ function guardarRegistroRapido(){
   const name=document.getElementById('rr-name').value.trim();
   const area=document.getElementById('rr-area').value.trim();
   if(!name){toast('Ingresa el nombre','err');return;}
-  workers.push({id:'w'+Date.now(),code,name,area,estado:'activo'});
+  const nuevoWorker={id:'w'+Date.now(),code,name,area,estado:'activo'};
+  workers.push(nuevoWorker);
   save(K.workers,workers);cerrarModal('ov-reg-rapido');
   ocultarResultado();cooldown=false;resetFlujo();
   toast('✅ Registrado. Escanea de nuevo tu carnet.','ok');
+  subirTrabajadorRemoto(nuevoWorker);
 }
 
 /* ── HISTORIAL ── */
@@ -1593,7 +1683,13 @@ if(cfg.scriptUrl){setTimeout(()=>descargarEstado(true),800);}
 // Refresco silencioso cada 45s mientras la app esté abierta, para reflejar
 // cambios hechos desde otros dispositivos sin que el usuario tenga que hacer nada
 setInterval(()=>{ if(cfg.scriptUrl && document.visibilityState==='visible') descargarEstado(false); }, 45000);
-if(!cfg.scriptUrl){setSyncStatus('offline','Sin sync');}else{setSyncStatus('offline',pendingSync.length>0?pendingSync.length+' pendientes':'Conectado');}
+if(!cfg.scriptUrl){
+  setSyncStatus('offline','Sin sync');
+}else if(pendingSync.length>0){
+  setSyncStatus('offline',pendingSync.length+' pendientes'); // rojo real: hay cosas sin enviar
+}else{
+  setSyncStatus('online','Conectado'); // verde: no hay pendientes, todo lo local ya se envió
+}
 </script>
 </body>
 </html>
