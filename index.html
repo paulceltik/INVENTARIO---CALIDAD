@@ -454,6 +454,14 @@ html,body{height:100%;width:100%;background:var(--gris-bg);font-family:-apple-sy
         <div id="test-result" style="margin-top:10px"></div>
       </div>
       <div class="admin-section">
+        <h4>🆕 ¿Primera vez en este dispositivo?</h4>
+        <p class="text-sm" style="font-size:12px;color:var(--texto-sec);line-height:1.6;margin-bottom:10px">
+          Si este es un celular/laptop nuevo, todavía tiene las herramientas y trabajadores de EJEMPLO.
+          Usa esto para reemplazarlos por los datos reales de Google Sheets (requiere la URL de arriba ya guardada).
+        </p>
+        <button class="btn btn-naranja btn-sm" onclick="configurarDispositivoNuevo()">🆕 Cargar datos reales de Sheets</button>
+      </div>
+      <div class="admin-section">
         <h4>Datos locales</h4>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn btn-outline btn-sm" onclick="exportCSV()">⬇ Exportar CSV</button>
@@ -1218,6 +1226,85 @@ async function subirTrabajadorRemoto(worker){
     if(!data.ok) console.warn('subirTrabajadorRemoto: el script devolvió error', data);
   }catch(e){
     console.warn('subirTrabajadorRemoto falló (quedará solo en este dispositivo por ahora):', e);
+  }
+}
+
+/* ── CONFIGURAR DISPOSITIVO NUEVO ──
+   Reemplaza los datos de EJEMPLO por los datos reales de Sheets.
+   Solo borra el demo DESPUÉS de confirmar que la descarga funcionó,
+   para nunca dejar al dispositivo sin nada si falla la conexión. */
+async function configurarDispositivoNuevo(){
+  if(!cfg.scriptUrl){
+    toast('Primero pega la URL del Apps Script arriba y presiona Guardar','warn');
+    return;
+  }
+  const confirmar = confirm(
+    'Esto reemplazará las herramientas y trabajadores de EJEMPLO de este dispositivo ' +
+    'por los datos reales que ya existen en Google Sheets.\n\n' +
+    'Úsalo solo la primera vez que abres la app en un dispositivo nuevo.\n\n' +
+    '¿Continuar?'
+  );
+  if(!confirmar) return;
+
+  toast('Descargando datos reales desde Sheets...','ok');
+  try{
+    const res = await fetch(cfg.scriptUrl,{
+      method:'POST', headers:{'Content-Type':'text/plain'},
+      body:JSON.stringify({accion:'obtenerEstado'})
+    });
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    if(!data.ok || !data.estadoHerramientas){
+      toast('⚠️ No se pudo confirmar la conexión. No se borró nada de este dispositivo.','err');
+      return;
+    }
+
+    // Conexión confirmada de verdad — recién aquí es seguro reemplazar
+    const herramientasRemotas = data.herramientas||[];
+    const trabajadoresRemotos = data.trabajadores||[];
+
+    if(herramientasRemotas.length===0 && trabajadoresRemotos.length===0){
+      toast('⚠️ Sheets no tiene herramientas ni trabajadores guardados todavía. No se borró nada.','warn');
+      return;
+    }
+
+    tools = herramientasRemotas.map(rh=>({
+      id: rh.id||('t'+Date.now()+Math.random().toString(36).slice(2,6)),
+      code: rh.code, name: rh.name, cat: rh.cat||'otro', desc: rh.desc||'', status:'in'
+    }));
+    workers = trabajadoresRemotos.map(rw=>({
+      id: rw.id||('w'+Date.now()+Math.random().toString(36).slice(2,6)),
+      code: rw.code, name: rw.name, area: rw.area||'', estado: rw.estado||'activo'
+    }));
+
+    // Aplicar el estado real (disponible/en uso) de cada herramienta
+    Object.entries(data.estadoHerramientas).forEach(([codigo, info])=>{
+      const t = tools.find(x=>x.code===codigo);
+      if(t) t.status = info.estado;
+    });
+
+    // Traer también el historial existente para no empezar con Historial vacío
+    movements = (data.movimientos||[]).map(rm=>({
+      id: rm.id,
+      toolId: (tools.find(t=>t.code===rm.codigoHerramienta)||{}).id || null,
+      toolCodeRemoto: rm.codigoHerramienta,
+      toolNameRemoto: rm.herramienta,
+      responsable: rm.trabajador,
+      codigoT: rm.codigoTrabajador,
+      tipo: rm.tipo==='SALIDA'?'s':'e',
+      ts: parseFechaHoraPeru(rm.fecha, rm.hora)
+    })).sort((a,b)=>a.ts-b.ts);
+    pendingSync = [];
+
+    save(K.tools,tools); save(K.workers,workers); save(K.movements,movements); save(K.pending,pendingSync);
+    renderTools(); renderWorkers(); renderHistorial(); actualizarKPIs();
+    conexionConfirmada = true;
+    setSyncStatus('online','Conectado');
+    renderSyncBanners();
+    cerrarModal('ov-admin');
+    toast(`✅ Listo: ${tools.length} herramientas y ${workers.length} trabajadores cargados desde Sheets`,'ok');
+  }catch(e){
+    toast('⚠️ Error de conexión, no se borró nada: '+(e.message||'error de red'),'err');
   }
 }
 
